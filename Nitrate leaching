@@ -1,54 +1,54 @@
 import time
 start_time = time.perf_counter()
 
-import rasterio
-from rasterio.transform import rowcol
-from rasterio.warp import transform
+from osgeo import gdal
+gdal.UseExceptions()
+
+from pyproj import Transformer
 import numpy as np
 from scipy.spatial import cKDTree
 import sys
 
 # -------------------------------------------------
-# Open raster helper
+# Open raster helper (SAFE for normal-sized rasters)
 # -------------------------------------------------
-def open_raster(path, read_array=True):
-    ds = rasterio.open(path)
-    nodata = ds.nodata
-
-    if read_array:
-        arr = ds.read(1)
-    else:
-        arr = None
-
-    return ds, arr, nodata, ds.transform, ds.crs
-
+def open_raster(path):
+    ds = gdal.Open(path)
+    if ds is None:
+        raise FileNotFoundError(f"Could not open {path}")
+    band = ds.GetRasterBand(1)
+    return (
+        ds,
+        band.ReadAsArray(),
+        band.GetNoDataValue(),
+        ds.GetGeoTransform(),
+        ds.GetProjection()
+    )
 
 # -------------------------------------------------
 # Convert XY → row/col
 # -------------------------------------------------
-def xy_to_rowcol(transform, arr, x, y):
-    row, col = rowcol(transform, x, y)
+def xy_to_rowcol(gt, arr, x, y):
+    col = int((x - gt[0]) / gt[1])
+    row = int((y - gt[3]) / gt[5])
 
     if arr is not None:
         if row < 0 or col < 0 or row >= arr.shape[0] or col >= arr.shape[1]:
             return None, None
     return row, col
 
-
 # -------------------------------------------------
 # Nearest valid pixel using KDTree
 # -------------------------------------------------
-def nearest_valid_value(arr, nodata, transform, x, y):
+def nearest_valid_value(arr, nodata, gt, x, y):
     rows, cols = arr.shape
 
-    xs = np.arange(cols)
-    ys = np.arange(rows)
-
-    X, Y = np.meshgrid(xs, ys)
-    coords = np.column_stack(rasterio.transform.xy(transform, Y, X))
+    x_coords = gt[0] + (np.arange(cols) + 0.5) * gt[1]
+    y_coords = gt[3] + (np.arange(rows) + 0.5) * gt[5]
+    X, Y = np.meshgrid(x_coords, y_coords)
 
     mask = arr != nodata
-    coords = coords[mask]
+    coords = np.column_stack((X[mask], Y[mask]))
     values = arr[mask]
 
     tree = cKDTree(coords)
@@ -56,48 +56,40 @@ def nearest_valid_value(arr, nodata, transform, x, y):
 
     return values[idx], coords[idx]
 
-
 # -------------------------------------------------
-# Read single pixel safely (for large rasters)
+# Read a single pixel safely
 # -------------------------------------------------
-def read_pixel(ds, row, col):
+def read_pixel(band, row, col):
     try:
-        window = rasterio.windows.Window(col, row, 1, 1)
-        val = ds.read(1, window=window)
+        val = band.ReadAsArray(col, row, 1, 1)
+        if val is None:
+            return None
         return val[0, 0]
-    except:
+    except RuntimeError:
         return None
 
+# -------------------------------------------------
+# Load NORMAL rasters (4326)
+# -------------------------------------------------
+ds_ph, arr_ph, nodata_ph, gt_ph, proj = open_raster("F:/NP/pH_CaCl/4326.tif")
+ds_water, arr_water, nodata_water, gt_water, _ = open_raster("F:/NP/water_mask_whole_reprojected_EU.tif")
+ds_koppen, arr_koppen, nodata_koppen, gt_koppen, _ = open_raster("F:/NP/Prototype_input_original_image-20260107T225850Z-1-001/Prototype_input_original_image/Koppen_climate/koppen_geiger_0p00833333.tif")
+ds_kfac, arr_kfac, nodata_kfac, gt_kfac, _ = open_raster("F:/NP/Prototype_input_original_image-20260107T225850Z-1-001/Prototype_input_original_image/Erodibility_Kfactor/K-Factor.tif")
 
 # -------------------------------------------------
-# Load normal rasters
+# Load LARGE rasters (3035)
 # -------------------------------------------------
-ds_ph, arr_ph, nodata_ph, tr_ph, crs_main = open_raster(
-    "F:/NP/pH_CaCl/4326.tif"
-)
+def open_large_raster(path):
+    ds = gdal.Open(path)
+    if ds is None:
+        raise FileNotFoundError(f"Could not open {path}")
+    band = ds.GetRasterBand(1)
+    return ds, band, band.GetNoDataValue(), ds.GetGeoTransform(), ds.GetProjection()
 
-ds_water, arr_water, nodata_water, tr_water, _ = open_raster(
-    "F:/NP/water_mask_whole_reprojected_EU.tif"
-)
-
-ds_koppen, arr_koppen, nodata_koppen, tr_koppen, _ = open_raster(
-    "F:/NP/Prototype_input_original_image-20260107T225850Z-1-001/"
-    "Prototype_input_original_image/Koppen_climate/"
-    "koppen_geiger_0p00833333.tif"
-)
-
-ds_kfac, arr_kfac, nodata_kfac, tr_kfac, _ = open_raster(
-    "F:/NP/Kfactor _4236.tif"
-)
-
-# -------------------------------------------------
-# Load huge slope raster (no full read)
-# -------------------------------------------------
-ds_slope, _, nodata_slope, tr_slope, crs_slope = open_raster(
-    "F:/NP/Prototype_input_original_image-20260107T225850Z-1-001/"
-    "Prototype_input_original_image/slope/eudem_slop_3035_europe.tif",
-    read_array=False
-)
+ds_slope, band_slope, nodata_slope, gt_slope, proj_slope = open_large_raster("F:/NP/Prototype_input_original_image-20260107T225850Z-1-001/Prototype_input_original_image/slope/eudem_slop_3035_europe.tif")
+ds_clay, band_clay, nodata_clay, gt_clay, proj_clay = open_large_raster("F:/NP/Clay_Extra/Clay.tif")
+ds_cn, band_cn, nodata_cn, gt_cn, proj_cn = open_large_raster("F:/NP/CN/CN.tif")
+ds_bulk, band_bulk, nodata_bulk, gt_bulk, proj_bulk = open_large_raster("F:/NP/BulkDensity_Extra/Bulk_density.tif")
 
 # -------------------------------------------------
 # Input coordinate (WGS84)
@@ -105,124 +97,82 @@ ds_slope, _, nodata_slope, tr_slope, crs_slope = open_raster(
 lat = float(input("Enter latitude: "))
 lon = float(input("Enter longitude: "))
 
-# Transform to main raster CRS
-x, y = transform("EPSG:4326", crs_main, [lon], [lat])
-x, y = x[0], y[0]
+transformer_main = Transformer.from_crs("EPSG:4326", proj, always_xy=True)
+x, y = transformer_main.transform(lon, lat)
 
 # -------------------------------------------------
-# STEP 1: Water check
+# WATER CHECK
 # -------------------------------------------------
-row_w, col_w = xy_to_rowcol(tr_water, arr_water, x, y)
+row_w, col_w = xy_to_rowcol(gt_water, arr_water, x, y)
 
 if row_w is None:
-    print("Input location outside water mask extent.")
+    print("Outside water mask.")
     sys.exit()
 
-water_value = arr_water[row_w, col_w]
-
-if water_value == nodata_water:
-    print("Water mask: Sea at input location.")
+if arr_water[row_w, col_w] == 1:
+    print("Location in water.")
     sys.exit()
 
-if water_value == 1:
-    print("Input location is in WATER. Stopping.")
-    sys.exit()
-
-print("Input location is on LAND")
+print("Location on land")
 
 # -------------------------------------------------
-# STEP 2: Extract pH, Köppen, K-factor
+# pH, Köppen, K-factor
 # -------------------------------------------------
-row_ph, col_ph = xy_to_rowcol(tr_ph, arr_ph, x, y)
-row_k, col_k = xy_to_rowcol(tr_koppen, arr_koppen, x, y)
-row_kf, col_kf = xy_to_rowcol(tr_kfac, arr_kfac, x, y)
+row_ph, col_ph = xy_to_rowcol(gt_ph, arr_ph, x, y)
+row_k, col_k = xy_to_rowcol(gt_koppen, arr_koppen, x, y)
+row_kf, col_kf = xy_to_rowcol(gt_kfac, arr_kfac, x, y)
 
-ph_value = arr_ph[row_ph, col_ph] if row_ph is not None else None
-koppen_value = arr_koppen[row_k, col_k] if row_k is not None else None
-kfactor_value = arr_kfac[row_kf, col_kf] if row_kf is not None else None
-
-used_nearest = False
-nx, ny = x, y
+ph_value = float(arr_ph[row_ph, col_ph]) if row_ph is not None else None
+koppen_value = float(arr_koppen[row_k, col_k]) if row_k is not None else None
+kfactor_value = float(arr_kfac[row_kf, col_kf]) if row_kf is not None else None
 
 # -------------------------------------------------
-# STEP 3: Nearest fallback
+# Transformer for 3035 rasters
 # -------------------------------------------------
-if ph_value in (None, nodata_ph):
-    ph_value, (nx, ny) = nearest_valid_value(arr_ph, nodata_ph, tr_ph, x, y)
-    used_nearest = True
-
-if koppen_value in (None, nodata_koppen):
-    koppen_value, _ = nearest_valid_value(arr_koppen, nodata_koppen, tr_koppen, x, y)
-    used_nearest = True
-
-if kfactor_value in (None, nodata_kfac):
-    kfactor_value, _ = nearest_valid_value(arr_kfac, nodata_kfac, tr_kfac, x, y)
-    used_nearest = True
+transformer_3035 = Transformer.from_crs("EPSG:4326", proj_slope, always_xy=True)
+x_3035, y_3035 = transformer_3035.transform(lon, lat)
 
 # -------------------------------------------------
-# STEP 4: Slope extraction (EPSG:3035)
+# Generic nearest search for large rasters
 # -------------------------------------------------
-x_3035, y_3035 = transform("EPSG:4326", crs_slope, [lon], [lat])
-x_3035, y_3035 = x_3035[0], y_3035[0]
+def get_value_large(band, gt, nodata, x, y):
+    row, col = xy_to_rowcol(gt, None, x, y)
+    value = read_pixel(band, row, col)
+    used_nearest = False
 
-row_s, col_s = xy_to_rowcol(tr_slope, None, x_3035, y_3035)
-
-slope_value = None
-used_nearest_slope = False
-
-if row_s is not None:
-    slope_value = read_pixel(ds_slope, row_s, col_s)
-
-# Small expanding window fallback
-if slope_value in (None, nodata_slope):
-    found = False
-    for radius in range(1, 11):
-        for dr in range(-radius, radius + 1):
-            for dc in range(-radius, radius + 1):
-                r = row_s + dr
-                c = col_s + dc
-                if r < 0 or c < 0:
-                    continue
-                val = read_pixel(ds_slope, r, c)
-                if val not in (None, nodata_slope):
-                    slope_value = val
-                    used_nearest_slope = True
-                    found = True
-                    break
-            if found:
-                break
-        if found:
-            break
+    if value in (None, nodata):
+        for radius in range(1, 11):
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    r = row + dr
+                    c = col + dc
+                    if r < 0 or c < 0:
+                        continue
+                    val = read_pixel(band, r, c)
+                    if val not in (None, nodata):
+                        return val, True
+    return value, used_nearest
 
 # -------------------------------------------------
-# Convert output coordinate back to WGS84
+# Extract 3035 variables
 # -------------------------------------------------
-lon_out, lat_out = transform(crs_main, "EPSG:4326", [nx], [ny])
-lon_out, lat_out = lon_out[0], lat_out[0]
+slope_value, used_nearest_slope = get_value_large(band_slope, gt_slope, nodata_slope, x_3035, y_3035)
+clay_value, used_nearest_clay = get_value_large(band_clay, gt_clay, nodata_clay, x_3035, y_3035)
+cn_value, used_nearest_cn = get_value_large(band_cn, gt_cn, nodata_cn, x_3035, y_3035)
+bulk_value, used_nearest_bulk = get_value_large(band_bulk, gt_bulk, nodata_bulk, x_3035, y_3035)
 
 # -------------------------------------------------
 # Output
 # -------------------------------------------------
 print("\nFinal result:")
-print(f"Longitude : {lon_out}")
-print(f"Latitude  : {lat_out}")
-print(f"pH value  : {ph_value}")
-print(f"Köppen class value : {koppen_value}")
-print(f"K-factor value    : {kfactor_value}")
-print(f"Slope value       : {slope_value}")
+print(f"pH: {ph_value}")
+print(f"Köppen: {koppen_value}")
+print(f"K-factor: {kfactor_value}")
+print(f"Slope: {slope_value}")
+print(f"Clay: {clay_value}")
+print(f"Curve Number: {cn_value}")
+print(f"Bulk density: {bulk_value}")
 
-if used_nearest:
-    print("⚠ Used nearest valid pixel for 4326")
-else:
-    print("✓ Used exact input pixel for 4326")
-
-if used_nearest_slope:
-    print("⚠ Used nearest valid pixel for 3035")
-else:
-    print("✓ Used exact input pixel for 3035")
-
-# -------------------------------------------------
-# Execution time
-# -------------------------------------------------
 end_time = time.perf_counter()
 print(f"\nElapsed time: {end_time - start_time:.1f} seconds")
+
